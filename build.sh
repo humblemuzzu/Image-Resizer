@@ -20,13 +20,34 @@ mkdir -p "$APP_PATH/Contents/Resources"
 # Copy Info.plist
 cp ClaudeImageResizer/Info.plist "$APP_PATH/Contents/"
 
+# Sources shared by both entry points. ImageBudget.swift holds every number from
+# docs/claude-vision-spec.md; nothing else is allowed to hardcode a limit.
+SHARED_SOURCES=(
+    ClaudeImageResizer/ImageBudget.swift
+    ClaudeImageResizer/ImageBudgetSelfTest.swift
+    ClaudeImageResizer/PixelResize.swift
+)
+
 # Compile Swift code
 swiftc -O \
     -target arm64-apple-macosx12.0 \
     -o "$APP_PATH/Contents/MacOS/ClaudeImageResizer" \
+    "${SHARED_SOURCES[@]}" \
     ClaudeImageResizer/main.swift \
     -framework Cocoa \
-    -framework UserNotifications
+    -framework UserNotifications \
+    || exit 1
+
+# The standalone script shares the same budget maths, so it is built here rather
+# than run with `swift ClaudeImageResizer.swift` - which would silently compile
+# against nothing and drift, which is how it ended up measuring points.
+swiftc -O \
+    -target arm64-apple-macosx12.0 \
+    -o "$OUTPUT_DIR/claude-image-resizer-script" \
+    "${SHARED_SOURCES[@]}" \
+    ClaudeImageResizer.swift \
+    -framework Cocoa \
+    || exit 1
 
 # Check if build succeeded
 if [ $? -eq 0 ]; then
