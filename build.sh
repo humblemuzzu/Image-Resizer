@@ -49,6 +49,12 @@ swiftc -O \
     -framework Cocoa \
     || exit 1
 
+# Fail the build if the app disagrees with the published spec numbers.
+"$APP_PATH/Contents/MacOS/ClaudeImageResizer" --selftest > /dev/null || {
+    echo "❌ Self-test failed - run with --selftest to see which assertions broke"
+    exit 1
+}
+
 # Check if build succeeded
 if [ $? -eq 0 ]; then
     echo "✅ Build successful!"

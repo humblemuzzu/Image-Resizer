@@ -14,10 +14,24 @@ class ClipboardImageResizer {
         return formatter
     }()
     
-    // Claude's recommended optimal dimension limit
-    let maxDimension: CGFloat = 1568
-    // Target file size (5MB) for Claude uploads
-    let maxFileSize: Int = 5_000_000
+    private static let tierDefaultsKey = "resolutionTier"
+
+    /// Spec §2. Standard is the default because an image sized for it is accepted
+    /// everywhere; a high-resolution-sized image is simply resized again by any
+    /// model older than Claude 4.7.
+    var tier: ResolutionTier {
+        get { ResolutionTier(rawValue: UserDefaults.standard.string(forKey: Self.tierDefaultsKey) ?? "") ?? .standard }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: Self.tierDefaultsKey) }
+    }
+
+    /// Spec §9 prefers fewer pixels over lossy artefacts, so a PNG that misses the
+    /// byte budget is retried at these fractions of the ideal size before quality is
+    /// touched at all.
+    private static let dimensionRetrySteps: [Double] = [1.0, 0.85, 0.72, 0.61, 0.52]
+
+    /// Spec §9: heavy JPEG compression makes text hard to read, and screenshots of
+    /// text are what this app exists to ship. The old ladder bottomed out at 0.3.
+    private static let jpegQualitySteps: [Double] = [0.95, 0.9, 0.85, 0.8, 0.75]
     
     private init() {
         lastChangeCount = pasteboard.changeCount
@@ -29,7 +43,8 @@ class ClipboardImageResizer {
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.checkClipboard()
         }
-        print("✅ Claude Image Resizer started - monitoring clipboard for images > \(Int(maxDimension))px")
+        let limits = tier.limits
+        print("✅ Claude Image Resizer started - \(tier.displayName): \(limits.maxTokens) visual tokens, \(limits.maxEdge)px max edge")
     }
     
     func stopMonitoring() {
@@ -44,22 +59,12 @@ class ClipboardImageResizer {
         // Check if clipboard has an image
         guard let image = getImageFromPasteboard() else { return }
 
-        // IMPORTANT: Get actual PIXEL dimensions, not point dimensions!
-        // On Retina displays, image.size returns points (half of actual pixels)
-        let pixelWidth: CGFloat
-        let pixelHeight: CGFloat
-        if let tiffData = image.tiffRepresentation,
-           let bitmap = NSBitmapImageRep(data: tiffData) {
-            pixelWidth = CGFloat(bitmap.pixelsWide)
-            pixelHeight = CGFloat(bitmap.pixelsHigh)
-        } else {
-            // Fallback to point dimensions if we can't get pixel dimensions
-            pixelWidth = image.size.width
-            pixelHeight = image.size.height
-        }
-        
+        // PIXEL dimensions, not points: on Retina, image.size reports half the
+        // pixels Claude will actually be charged for.
+        let source = pixelSize(of: image)
+
         let timestamp = dateFormatter.string(from: Date())
-        let originalDimensions = "\(Int(pixelWidth))x\(Int(pixelHeight))"
+        let originalDimensions = "\(source.width)x\(source.height)"
 
         // Get actual clipboard data size (check JPEG first, then PNG, then estimate from TIFF)
         let originalFileSize: Int
@@ -72,48 +77,44 @@ class ClipboardImageResizer {
             originalFileSize = image.tiffRepresentation?.count ?? 0
         }
 
-        // Check if processing is needed - ONLY if PIXEL dimensions exceed limit
-        let needsResize = pixelWidth > maxDimension || pixelHeight > maxDimension
+        // Spec §4: the visual token budget is what binds, not the long edge. A
+        // 1568x859 image is inside the edge limit on both sides and still costs 1736
+        // tokens, so the API resizes it again unless we get there first.
+        let limits = tier.limits
+        let target = ImageBudget.targetSize(width: source.width, height: source.height, limits: limits)
+        let originalTokens = ImageBudget.countImageTokens(width: source.width, height: source.height)
+        // Spec §7: the size limit applies to the base64 payload, ~1.37x the raw bytes.
+        let payloadFits = ImageBudget.base64Bytes(originalFileSize) <= ImageBudget.maxBase64Bytes
 
-        if !needsResize && originalFileSize <= maxFileSize {
-            let message = "[\(timestamp)] ✅ Within limits: \(originalDimensions) (\(formatBytes(originalFileSize)))"
+        if target == nil && payloadFits {
+            let message = "[\(timestamp)] ✅ Within limits: \(originalDimensions) (\(formatBytes(originalFileSize)), \(originalTokens) tokens)"
             print(message)
             postHistoryEvent(message: message, fileURL: nil)
             return
         }
 
-        // Resize and compress the image using PIXEL dimensions
-        if let result = resizeAndCompressPixels(image, pixelWidth: pixelWidth, pixelHeight: pixelHeight, maxDimension: maxDimension, maxSize: maxFileSize) {
-            writeImageToPasteboard(result.image, imageData: result.data, format: result.format)
+        // A nil target means the dimensions were fine and only the payload was over,
+        // so there is nothing to scale down until an encode attempt says otherwise.
+        guard let result = resizeAndEncode(image, target: target ?? source) else { return }
 
-            // Get the actual pixel dimensions of the result
-            let newPixelWidth: Int
-            let newPixelHeight: Int
-            if let tiffData = result.image.tiffRepresentation,
-               let bitmap = NSBitmapImageRep(data: tiffData) {
-                newPixelWidth = bitmap.pixelsWide
-                newPixelHeight = bitmap.pixelsHigh
-            } else {
-                newPixelWidth = Int(result.image.size.width)
-                newPixelHeight = Int(result.image.size.height)
-            }
-            
-            let newDimensions = "\(newPixelWidth)x\(newPixelHeight)"
-            let savedURL = saveImageToDisk(imageData: result.data, format: result.format, timestamp: timestamp)
+        writeImageToPasteboard(imageData: result.data, format: result.format)
 
-            let message = "[\(timestamp)] 📐 Optimized: \(originalDimensions) → \(newDimensions) (\(formatBytes(originalFileSize)) → \(formatBytes(result.data.count)))"
-            print(message)
-            postHistoryEvent(message: message, fileURL: savedURL)
+        let newDimensions = "\(result.width)x\(result.height)"
+        let newTokens = ImageBudget.countImageTokens(width: result.width, height: result.height)
+        let savedURL = saveImageToDisk(imageData: result.data, format: result.format, timestamp: timestamp)
 
-            // Show notification with file size info
-            showNotification(
-                originalSize: originalDimensions,
-                newSize: newDimensions,
-                originalBytes: originalFileSize,
-                newBytes: result.data.count,
-                fileURL: savedURL
-            )
-        }
+        let message = "[\(timestamp)] 📐 Optimized: \(originalDimensions) → \(newDimensions) (\(formatBytes(originalFileSize)) → \(formatBytes(result.data.count)), \(originalTokens) → \(newTokens) tokens)"
+        print(message)
+        postHistoryEvent(message: message, fileURL: savedURL)
+
+        // Show notification with file size info
+        showNotification(
+            originalSize: originalDimensions,
+            newSize: newDimensions,
+            originalBytes: originalFileSize,
+            newBytes: result.data.count,
+            fileURL: savedURL
+        )
     }
 
     /// Formats bytes into human-readable string (KB, MB)
@@ -147,58 +148,7 @@ class ClipboardImageResizer {
         return nil
     }
     
-    /// Resizes image to fit within maxDimension PIXELS (not points)
-    /// This creates a new bitmap at the exact pixel dimensions we want
-    private func resizeImagePixels(_ image: NSImage, currentPixelWidth: CGFloat, currentPixelHeight: CGFloat, maxDimension: CGFloat) -> NSImage? {
-        let longerSide = max(currentPixelWidth, currentPixelHeight)
-
-        // Only resize if image is LARGER than maxDimension - never upscale!
-        if longerSide <= maxDimension {
-            return image  // Return original, no resize needed
-        }
-
-        // Calculate scale factor to fit within maxDimension PIXELS
-        let scaleFactor = maxDimension / longerSide
-        let newPixelWidth = Int(currentPixelWidth * scaleFactor)
-        let newPixelHeight = Int(currentPixelHeight * scaleFactor)
-
-        // Create a bitmap representation at exact pixel dimensions
-        guard let bitmapRep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: newPixelWidth,
-            pixelsHigh: newPixelHeight,
-            bitsPerSample: 8,
-            samplesPerPixel: 4,
-            hasAlpha: true,
-            isPlanar: false,
-            colorSpaceName: .deviceRGB,
-            bytesPerRow: 0,
-            bitsPerPixel: 0
-        ) else { return nil }
-
-        // Set the size to match pixels (1:1 ratio, no Retina scaling)
-        bitmapRep.size = NSSize(width: newPixelWidth, height: newPixelHeight)
-
-        // Draw into the bitmap
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmapRep)
-        NSGraphicsContext.current?.imageInterpolation = .high
-        
-        image.draw(in: NSRect(x: 0, y: 0, width: newPixelWidth, height: newPixelHeight),
-                   from: NSRect(origin: .zero, size: image.size),
-                   operation: .copy,
-                   fraction: 1.0)
-        
-        NSGraphicsContext.restoreGraphicsState()
-
-        // Create NSImage from the bitmap
-        let newImage = NSImage(size: NSSize(width: newPixelWidth, height: newPixelHeight))
-        newImage.addRepresentation(bitmapRep)
-        
-        return newImage
-    }
-    
-    private func writeImageToPasteboard(_ image: NSImage, imageData: Data, format: String) {
+    private func writeImageToPasteboard(imageData: Data, format: String) {
         pasteboard.clearContents()
 
         // Write ONLY the compressed format data (PNG or JPEG) to the pasteboard.
@@ -256,63 +206,57 @@ class ClipboardImageResizer {
         )
     }
     
-    /// Resizes and compresses image to meet both PIXEL dimension and file size constraints
-    private func resizeAndCompressPixels(_ image: NSImage,
-                                         pixelWidth: CGFloat,
-                                         pixelHeight: CGFloat,
-                                         maxDimension: CGFloat,
-                                         maxSize: Int) -> (image: NSImage, data: Data, format: String)? {
-        var currentMaxDimension = maxDimension
-
-        while currentMaxDimension >= 800 {
-            let resized = resizeImagePixels(image, currentPixelWidth: pixelWidth, currentPixelHeight: pixelHeight, maxDimension: currentMaxDimension) ?? image
-
-            if let result = compressImage(resized, maxSize: maxSize) {
-                return (resized, result.data, result.format)
-            }
-
-            // Reduce dimension by 15% and try again
-            currentMaxDimension *= 0.85
-        }
-
-        // Last resort: smallest size with aggressive compression
-        let smallest = resizeImagePixels(image, currentPixelWidth: pixelWidth, currentPixelHeight: pixelHeight, maxDimension: 800) ?? image
-        if let result = compressImage(smallest, maxSize: Int.max) {
-            return (smallest, result.data, result.format)
-        }
-
-        return nil
+    private struct Encoded {
+        let data: Data
+        let format: String
+        let width: Int
+        let height: Int
     }
 
-    /// Compresses image to target size, trying PNG first then JPEG with decreasing quality
-    private func compressImage(_ image: NSImage, maxSize: Int) -> (data: Data, format: String)? {
-        guard let tiffData = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData) else { return nil }
+    /// Produces the exact bytes to put on the pasteboard.
+    ///
+    /// Dimensions come down before quality does: spec §9 warns that lossy artefacts
+    /// hurt the model and that heavy JPEG compression makes text hard to read. With
+    /// the token budget capping a target at ~1.19 MP, the first PNG attempt wins for
+    /// any real screenshot and everything below it is a genuine last resort.
+    private func resizeAndEncode(_ image: NSImage, target: (width: Int, height: Int)) -> Encoded? {
+        var smallestPNG: Encoded?
 
-        // Try PNG first (good for screenshots/graphics)
-        if let pngData = bitmap.representation(using: .png, properties: [:]),
-           pngData.count <= maxSize {
-            return (pngData, "png")
+        for step in Self.dimensionRetrySteps {
+            let candidate = ImageBudget.scaledDown(width: target.width, height: target.height, by: step)
+            guard let bitmap = redraw(image, toPixelSize: candidate),
+                  let png = bitmap.representation(using: .png, properties: [:]) else { continue }
+            let encoded = Encoded(data: png, format: "png", width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
+            if ImageBudget.base64Bytes(png.count) <= ImageBudget.maxBase64Bytes {
+                return encoded
+            }
+            smallestPNG = encoded
         }
 
-        // Try JPEG with decreasing quality
-        for quality in stride(from: 0.9, through: 0.4, by: -0.1) {
-            if let jpegData = bitmap.representation(using: .jpeg,
-                properties: [.compressionFactor: quality]),
-               jpegData.count <= maxSize {
-                return (jpegData, "jpg")
+        // WebP would be the better lossy format for text and spec §8 lists it as
+        // supported, but NSBitmapImageRep.FileType has no WebP case on macOS and
+        // ImageIO advertises no WebP destination either, so JPEG is the only lossy
+        // option available without a new dependency.
+        let smallest = ImageBudget.scaledDown(width: target.width, height: target.height,
+                                              by: Self.dimensionRetrySteps.last ?? 1.0)
+        if let bitmap = redraw(image, toPixelSize: smallest) {
+            for quality in Self.jpegQualitySteps {
+                guard let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality]),
+                      ImageBudget.base64Bytes(jpeg.count) <= ImageBudget.maxBase64Bytes else { continue }
+                print("⚠️ No PNG fit the base64 budget - falling back to lossy JPEG at quality \(quality) at \(bitmap.pixelsWide)x\(bitmap.pixelsHigh); text may soften")
+                return Encoded(data: jpeg, format: "jpg", width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
             }
         }
 
-        // Return lowest quality JPEG as fallback
-        if let jpegData = bitmap.representation(using: .jpeg,
-            properties: [.compressionFactor: 0.3]) {
-            return (jpegData, "jpg")
+        if let smallestPNG {
+            print("⚠️ Nothing fit the base64 budget, even at JPEG quality \(Self.jpegQualitySteps.last ?? 0) - shipping a lossless \(smallestPNG.width)x\(smallestPNG.height) PNG over budget rather than mangling the text further")
+            return smallestPNG
         }
 
+        print("⚠️ Could not encode the clipboard image at all - leaving the clipboard untouched")
         return nil
     }
-    
+
     private func saveImageToDisk(imageData: Data, format: String, timestamp: String) -> URL? {
         guard let picturesDir = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first else {
             return nil
@@ -387,10 +331,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         guard let menu = menu else { return }
         menu.removeAllItems()
         
-        let statusMenuItem = NSMenuItem(title: "Max: 1568px (Claude limit)", action: nil, keyEquivalent: "")
-        statusMenuItem.isEnabled = false
-        menu.addItem(statusMenuItem)
-        
+        // The long edge is not the operative limit; the visual token budget is
+        // (spec §4), so the menu states the budget and the sizes it works out to.
+        let limits = resizer.tier.limits
+        let squareCeiling = ImageBudget.resizedSize(width: limits.maxEdge * 2, height: limits.maxEdge * 2, limits: limits)
+        let wideCeiling = ImageBudget.resizedSize(width: 3840, height: 2160, limits: limits)
+
+        let budgetItem = NSMenuItem(title: "Budget: \(limits.maxTokens) visual tokens, \(limits.maxEdge)px max edge", action: nil, keyEquivalent: "")
+        budgetItem.isEnabled = false
+        menu.addItem(budgetItem)
+
+        let ceilingItem = NSMenuItem(title: "Fits as-is: \(squareCeiling.width)x\(squareCeiling.height) square, \(wideCeiling.width)x\(wideCeiling.height) at 16:9", action: nil, keyEquivalent: "")
+        ceilingItem.isEnabled = false
+        menu.addItem(ceilingItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let tierItem = NSMenuItem(title: "Resolution tier", action: nil, keyEquivalent: "")
+        let tierMenu = NSMenu()
+        for tier in ResolutionTier.allCases {
+            let item = NSMenuItem(title: tier.displayName, action: #selector(selectTier(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = tier.rawValue
+            item.state = tier == resizer.tier ? .on : .off
+            tierMenu.addItem(item)
+        }
+        tierItem.submenu = tierMenu
+        menu.addItem(tierItem)
+
         menu.addItem(NSMenuItem.separator())
         
         let historyHeader = NSMenuItem(title: "Recent Activity", action: nil, keyEquivalent: "")
@@ -429,6 +397,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
     
+    @objc private func selectTier(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let tier = ResolutionTier(rawValue: rawValue) else { return }
+        resizer.tier = tier
+        rebuildMenu()
+    }
+    
     @objc private func openHistoryFile(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSWorkspace.shared.open(url)
@@ -457,6 +432,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 }
 
 // MARK: - Main
+
+// Runs before anything touches NSApplication so the assertions can be checked in
+// CI or from a terminal without a menu bar item appearing.
+if CommandLine.arguments.contains("--selftest") {
+    exit(ImageBudgetSelfTest.run() ? 0 : 1)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
