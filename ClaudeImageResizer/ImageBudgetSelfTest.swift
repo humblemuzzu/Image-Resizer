@@ -70,13 +70,30 @@ enum ImageBudgetSelfTest {
                            ImageBudget.targetSize(width: 1092, height: 1092), nil)
         check.optionalSize("targetSize(200, 200) leaves a fitting image alone",
                            ImageBudget.targetSize(width: 200, height: 200), nil)
-        check.optionalSize("targetSize(1920, 1080) snaps 819 down to the patch grid",
-                           ImageBudget.targetSize(width: 1920, height: 1080), (1456, 812))
+        // The DEFAULT preserves aspect ratio exactly — it is Claude's own answer,
+        // untouched. Snapping to the patch grid trims the axes independently and
+        // therefore stretches, so it is opt-in.
+        check.optionalSize("targetSize(1920, 1080) is Claude's exact resize, aspect intact",
+                           ImageBudget.targetSize(width: 1920, height: 1080), (1456, 819))
         check.optionalSize("targetSize(1568, 859) fixes the case the old rule passed",
-                           ImageBudget.targetSize(width: 1568, height: 859), (1456, 812))
+                           ImageBudget.targetSize(width: 1568, height: 859), (1483, 812))
+        check.optionalSize("targetSize(1920, 1080, snap: true) trims 819 to the patch grid",
+                           ImageBudget.targetSize(width: 1920, height: 1080, snapToPatchGrid: true), (1456, 812))
+
+        // The default must never distort. 819/1456 against 1080/1920 is exact.
+        check.isTrue("the default target holds the source aspect ratio to within 0.1%", {
+            let t = ImageBudget.targetSize(width: 1920, height: 1080) ?? (1, 1)
+            let drift = abs(Double(t.width) / Double(t.height) - 1920.0 / 1080.0) / (1920.0 / 1080.0)
+            return drift < 0.001
+        }())
+        check.isTrue("snapping, when asked for, is what introduces the drift", {
+            let t = ImageBudget.targetSize(width: 1920, height: 1080, snapToPatchGrid: true) ?? (1, 1)
+            let drift = abs(Double(t.width) / Double(t.height) - 1920.0 / 1080.0) / (1920.0 / 1080.0)
+            return drift > 0.008
+        }())
 
         // Spec §5: a patch-aligned image is padded by nothing.
-        let aligned = ImageBudget.targetSize(width: 3840, height: 2160) ?? (0, 0)
+        let aligned = ImageBudget.targetSize(width: 3840, height: 2160, snapToPatchGrid: true) ?? (0, 0)
         check.size("a snapped target needs no padding",
                    ImageBudget.paddedSize(width: aligned.width, height: aligned.height), (aligned.width, aligned.height))
         check.isTrue("a snapped target still fits", ImageBudget.fits(width: aligned.width, height: aligned.height, limits: .standard))

@@ -115,14 +115,31 @@ enum ImageBudget {
     }
 
     /// The exact size to produce so that Claude's own pipeline resizes nothing
-    /// (spec §4) and pads nothing (spec §5) — one resampling pass instead of two,
-    /// which is visibly better for text (spec §9).
+    /// (spec §4) — one resampling pass instead of two, which is visibly better
+    /// for text (spec §9).
     ///
     /// Returns `nil` when the image already fits: resampling an image that needs
     /// no resampling only costs quality.
-    static func targetSize(width: Int, height: Int, limits: VisionLimits = .standard) -> (width: Int, height: Int)? {
+    ///
+    /// `snapToPatchGrid` additionally lands both axes on a multiple of 28 so that
+    /// Claude pads nothing (spec §5). It is OFF BY DEFAULT, and that is a
+    /// deliberate reversal. Snapping trims each axis independently, so it does not
+    /// preserve the aspect ratio: measured across real screenshots it stretches by
+    /// up to 2.7% (3024×1964 lands on 1372×868 instead of 1372×891), and a 1920×1080
+    /// frame is squashed 0.86% vertically to save 52 of 1560 tokens. Trading
+    /// geometry for 3% of the budget is the wrong default for a tool whose whole
+    /// job is handing Claude an accurate picture — and coordinates read off a
+    /// stretched screenshot are wrong in a way nobody can see. Callers that want
+    /// the last few tokens can ask for it.
+    static func targetSize(
+        width: Int,
+        height: Int,
+        limits: VisionLimits = .standard,
+        snapToPatchGrid: Bool = false
+    ) -> (width: Int, height: Int)? {
         let resized = resizedSize(width: width, height: height, limits: limits)
         guard resized.width != width || resized.height != height else { return nil }
+        guard snapToPatchGrid else { return resized }
         return snappedToPatchGrid(width: resized.width, height: resized.height)
     }
 
@@ -145,6 +162,10 @@ enum ImageBudget {
     /// and can only lower the token count, so it can never break a limit that the
     /// resize just satisfied. Skipped on an axis under one patch wide, where
     /// flooring would produce zero.
+    ///
+    /// Trims the axes independently, so THIS DOES NOT PRESERVE ASPECT RATIO —
+    /// up to 2.7% of stretch on real inputs. See `targetSize`, which leaves it off
+    /// by default for that reason.
     static func snappedToPatchGrid(width: Int, height: Int) -> (width: Int, height: Int) {
         (snappedDown(width), snappedDown(height))
     }

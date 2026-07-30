@@ -55,9 +55,11 @@ then pads the result up to the next multiple of 28 on the bottom and right.
 | square | 1092×1092 | 1932×1932 |
 | 16:9 | 1456×819 | 2576×1449 |
 
-(The high-resolution square figure is derived from the formula: 1932 = 69×28 and
-69² = 4761 ≤ 4784, whereas 2044 = 73×28 would cost 5329. `docs/claude-vision-spec.md`
-§10 prints 2044×2044, which its own §1 formula contradicts.)
+(The high-resolution square figure is derived from the formula rather than copied:
+1932 = 69×28 and 69² = 4761 ≤ 4784, whereas 2044 = 73×28 would cost 5329 against a
+4784 budget. An earlier draft of `docs/claude-vision-spec.md` printed 2044×2044; it
+is corrected there now, in §3a, along with one other published figure that a
+half-up rounding port reproduces and a correct one does not.)
 
 **Size limits apply to the base64-encoded payload, not the raw file.** Base64
 encodes 3 bytes as 4 characters, so a 4.5 MB PNG is a 6 MB request body. The app
@@ -74,8 +76,11 @@ Keep such requests to 20 or fewer images, or pre-resize below 2000 px yourself.
 
 - **Token-budget targeting**: resizes to exactly the size Claude would pick, so the
   API resizes nothing and text is resampled once rather than twice
-- **28px alignment**: snaps output to the patch grid, so Claude pads nothing and no
-  visual tokens are wasted
+- **Exact aspect ratio**: the target is Claude's own resize, untouched. Landing on
+  the 28px patch grid would let Claude pad nothing, but it trims each axis
+  independently and so stretches the image — up to 2.7% on real screenshots. Three
+  percent of the token budget is not worth distorting the picture, so it is off by
+  default and available as `snapToPatchGrid: true`
 - **Resolution tier setting**: standard by default (valid on every model), switchable
   to high-resolution from the menu bar
 - **Lossless first**: PNG at the target size; if the payload is still too big it
@@ -231,7 +236,7 @@ Click the notification to open the saved image file.
 - **Polling interval**: 50ms (lightweight—only compares an integer)
 - **Resize algorithm**: High-quality interpolation, never upscaling
 - **Encoding strategy**: PNG at the target size; if the base64 payload is still over
-  budget, dimensions come down in five steps before quality is touched, and JPEG
+  budget, dimensions come down through four reductions before quality is touched, and JPEG
   never goes below quality 0.75. WebP would be preferable for text and Claude
   accepts it, but `NSBitmapImageRep` cannot encode WebP on macOS.
 - **Retina handling**: Reads actual pixel dimensions from bitmap, not point dimensions
@@ -282,7 +287,7 @@ Changing one of those means changing what the app believes about Claude, so
 | Clipboard monitoring | ✅ | ✅ | ❌ |
 | File size compression | ✅ | ✅ | ❌ |
 | Claude-optimized defaults | ✅ | ❌ | ❌ |
-| Lightweight | ✅ (~500 lines) | ❌ (full app) | N/A |
+| Lightweight | ✅ (~930 lines, no dependencies) | ❌ (full app) | N/A |
 | Video support | ❌ | ✅ | N/A |
 
 ## Troubleshooting
